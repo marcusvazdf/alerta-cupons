@@ -24,6 +24,7 @@ CANAIS_TELEGRAM = [
     "cuponsmercadolivre",
     "ofertasamazonbr",
     "hardmob_promocoes",
+    "nerdcupons",
 ]
 
 LOJAS_ALVO = {
