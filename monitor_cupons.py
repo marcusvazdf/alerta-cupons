@@ -43,8 +43,15 @@ PALAVRAS_IGNORADAS = {
     "PIX", "APP", "PRIME", "FULL", "LINK", "AQUI", "HOJE", "AGORA",
     "LOJA", "MAIS", "GRATIS", "FRETE", "LISTA", "CLIQUE", "VALIDO",
     "ACIMA", "LIMITE", "CUPOM", "CUPONS", "NOVO", "CORRE", "AMAZON",
-    "SHOPEE", "MERCADO", "LIVRE", "OFERTA", "OFERTAS", "GRUPO", "GRUPOS"
+    "SHOPEE", "MERCADO", "LIVRE", "OFERTA", "OFERTAS", "GRUPO", "GRUPOS",
+    "HDR10", "FHD", "UHD", "QLED", "OLED", "DLED", "SMART", "WIFI",
+    "HDMI", "USB", "BIVOLT", "110V", "220V", "PRETO", "BRANCO"
 }
+
+# Bloqueia especificações técnicas de eletrônicos (ex: 8GB256GB, 2HDMI, 300HZ, 128GB)
+PADRAO_HARDWARE = re.compile(
+    r"^(\d+(GB|TB|MB|HZ|W|V|ML|KG|HDMI|USB|MP|MAH)|.*(GBRAM|HDMI|HDR|OLED|QLED|DLED|BIVOLT).*)$"
+)
 
 LINHAS_LIXO = [
     "mais grupos", "nerdofertas.com", "clique \"mostrar mais\"",
@@ -105,6 +112,15 @@ def escapar_html(texto):
         .replace(">", "&gt;")
     )
 
+def codigo_valido(cand):
+    if not re.fullmatch(r"[A-Z0-9]{4,20}", cand):
+        return False
+    if cand in PALAVRAS_IGNORADAS or cand.isdigit():
+        return False
+    if PADRAO_HARDWARE.match(cand):
+        return False
+    return True
+
 def limpar_linhas(texto_bruto):
     linhas_limpas = []
     for linha in texto_bruto.splitlines():
@@ -112,44 +128,39 @@ def limpar_linhas(texto_bruto):
         if not l:
             continue
         l_lower = l.lower()
-        # Remove URLs soltas e rodapés de divulgação de grupos
         if l_lower.startswith("http") or any(lixo in l_lower for lixo in LINHAS_LIXO):
             continue
-        # Remove emojis isolados na linha
         sem_simbolos = re.sub(r"[^\w\s%$,.:;!?()-]", "", l).strip()
-        if len(sem_simbolos) < 2:
-            continue
-        linhas_limpas.append(sem_simbolos)
+        if len(sem_simbolos) >= 2:
+            linhas_limpas.append(sem_simbolos)
     return linhas_limpas
 
 def extrair_cupons_estruturados(bloco_html, texto_bruto):
-    """
-    Retorna lista de tuplas (codigo, regra_resumida).
-    Descarta posts que não possuem código real de cupom.
-    """
     linhas = limpar_linhas(texto_bruto)
     codigos_encontrados = []
 
-    # 1. Prioridade: tags <code> ou <pre> (padrão do Telegram para cupons copiáveis)
+    # 1. Prioridade absoluta: tags <code> ou <pre> (padrão do Telegram para copiar cupom)
     for tag in bloco_html.find_all(["code", "pre"]):
         cand = tag.get_text(strip=True).upper()
-        if re.fullmatch(r"[A-Z0-9]{4,20}", cand) and cand not in PALAVRAS_IGNORADAS:
-            if cand not in codigos_encontrados:
+        if codigo_valido(cand) and cand not in codigos_encontrados:
+            codigos_encontrados.append(cand)
+
+    # 2. Busca apenas códigos precedidos por gatilho explícito de cupom na mesma linha ou na linha anterior
+    gatilhos = re.compile(
+        r"(?:cupom|c[oó]digo|use|aplique|resgate|limite\s+r\$\s*\d+\s*off)\s*[:\-]?\s*([A-Z0-9]{4,20})\b",
+        re.IGNORECASE,
+    )
+    for idx, linha in enumerate(linhas):
+        for match in gatilhos.findall(linha):
+            cand = match.upper()
+            if codigo_valido(cand) and cand not in codigos_encontrados:
                 codigos_encontrados.append(cand)
 
-    # 2. Busca códigos em caixa alta no texto (ex: MOVEIS2011, BLACK100, CUPOM15)
-    for linha in linhas:
-        # Ignora linhas que parecem modelo de produto (ex: 748ml, B01zrah4i, 12000)
-        if re.search(r"\b\d+(ml|g|kg|gb|tb|btu|v|w|cm|mm)\b", linha.lower()):
-            continue
-        for match in re.findall(r"\b([A-Z0-9]{5,18})\b", linha):
-            if match in PALAVRAS_IGNORADAS or match.isdigit():
-                continue
-            # Precisa ter letras e números OU ter contexto explícito de cupom na linha
-            tem_letra_e_num = any(c.isalpha() for c in match) and any(c.isdigit() for c in match)
-            contexto_cupom = any(p in linha.lower() for p in ["cupom", "código", "codigo", "off", "limite", "acima de", "use"])
-            if (tem_letra_e_num or contexto_cupom) and match not in codigos_encontrados:
-                codigos_encontrados.append(match)
+        # Caso a linha anterior diga "Use o cupom:" e o código esteja isolado na linha seguinte
+        if idx > 0 and re.search(r"(cupom|c[oó]digo|aplique|resgate)\s*[:\-]?\s*$", linhas[idx - 1], re.IGNORECASE):
+            cand = linha.strip().upper()
+            if codigo_valido(cand) and cand not in codigos_encontrados:
+                codigos_encontrados.append(cand)
 
     if not codigos_encontrados:
         return []
@@ -158,23 +169,20 @@ def extrair_cupons_estruturados(bloco_html, texto_bruto):
     for codigo in codigos_encontrados:
         regra = ""
         for idx, linha in enumerate(linhas):
-            if codigo in linha:
-                # Junta até 2 linhas imediatamente anteriores que tragam % OFF ou valor mínimo
+            if codigo in linha.upper():
                 contexto = []
                 for ant in linhas[max(0, idx - 2):idx]:
                     if any(k in ant.lower() for k in ["off", "%", "r$", "acima", "limite", "desconto", "mínimo", "minimo"]):
                         contexto.append(ant)
-                # Também aproveita texto da própria linha sem o código
-                resto_linha = linha.replace(codigo, "").strip(" :-•|")
+                resto_linha = re.sub(re.escape(codigo), "", linha, flags=re.IGNORECASE).strip(" :-•|")
                 if resto_linha and len(resto_linha) > 3:
                     contexto.append(resto_linha)
                 regra = " | ".join(contexto)
                 break
 
         if not regra:
-            # Pega a primeira linha que mencione desconto ou valor
             for linha in linhas:
-                if any(k in linha.lower() for k in ["off", "%", "r$", "desconto"]):
+                if any(k in linha.lower() for k in ["off", "%", "desconto"]):
                     regra = linha
                     break
 
@@ -217,7 +225,6 @@ def buscar_cupons():
                 link_post = f"https://t.me/{post_id}" if post_id else url_canal
 
                 for codigo, regra in pares_cupons:
-                    # Deduplica pelo par Loja + Código (evita receber o mesmo cupom de 5 canais diferentes)
                     chave_unica = f"cupom:{loja}:{codigo}"
                     if chave_unica in historico:
                         continue
