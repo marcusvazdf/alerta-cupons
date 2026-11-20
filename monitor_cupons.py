@@ -14,8 +14,8 @@ EMAIL_DESTINO = "marcusvaz.df@gmail.com"
 
 ARQUIVO_HISTORICO = "historico_cupons.json"
 
-# Adicione aqui o @username de qualquer canal PÚBLICO do Telegram que você acompanha
 CANAIS_TELEGRAM = [
+    "rochacupons",
     "pelando",
     "promobit",
     "gatry",
@@ -24,8 +24,6 @@ CANAIS_TELEGRAM = [
     "cuponsmercadolivre",
     "ofertasamazonbr",
     "hardmob_promocoes",
-    "nerdcupons",
-    "rochacupons",
 ]
 
 LOJAS_ALVO = {
@@ -89,13 +87,11 @@ def identificar_loja(texto_lower):
     return None
 
 def extrair_codigo(bloco_html, texto_limpo):
-    # 1. No Telegram, códigos de cupom quase sempre vêm formatados em <code> ou <pre> (toque para copiar)
     for tag_code in bloco_html.find_all(["code", "pre"]):
         cand = tag_code.get_text(strip=True)
         if 3 <= len(cand) <= 25 and " " not in cand:
             return cand
 
-    # 2. Fallback por padrão em caixa alta no texto
     candidatos = re.findall(r"\b([A-Z0-9]{4,20})\b", texto_limpo)
     ignorados = {
         "HTTP", "HTTPS", "HTML", "FREE", "PARA", "COM", "SEM", "OFF",
@@ -115,7 +111,7 @@ def escapar_html(texto):
 
 def buscar_cupons():
     historico = carregar_historico()
-    novos_encontrados = 0
+    novos_cupons_email = []
 
     for canal in CANAIS_TELEGRAM:
         canal_limpo = canal.lstrip("@").strip()
@@ -124,13 +120,11 @@ def buscar_cupons():
         try:
             resp = requests.get(url_canal, headers=HEADERS, timeout=20)
             if resp.status_code != 200:
-                print(f"Canal @{canal_limpo} indisponível ou privado (status {resp.status_code})")
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
             mensagens = soup.select(".tgme_widget_message_wrap")
 
-            # Analisa as 12 mensagens mais recentes de cada canal
             for msg_wrap in mensagens[-12:]:
                 msg_div = msg_wrap.select_one(".tgme_widget_message")
                 texto_div = msg_wrap.select_one(".tgme_widget_message_text")
@@ -155,12 +149,12 @@ def buscar_cupons():
                     continue
 
                 historico.add(chave_unica)
-                novos_encontrados += 1
 
                 link_post = f"https://t.me/{post_id}" if post_id else url_canal
                 resumo = escapar_html(texto_limpo[:450])
                 linha_codigo = f"🎟️ <b>Cupom:</b> <code>{escapar_html(codigo)}</code>\n" if codigo else ""
 
+                # Envia individualmente no Telegram (rápido e fácil de copiar com 1 toque)
                 msg_tg = (
                     f"{loja} — <b>NOVO CUPOM</b>\n"
                     f"📡 <i>Fonte: @{escapar_html(canal_limpo)}</i>\n\n"
@@ -170,16 +164,29 @@ def buscar_cupons():
                 )
                 enviar_telegram(msg_tg)
 
-                if EMAIL_USER and EMAIL_PASS:
-                    enviar_email(
-                        f"🎟️ Cupom {loja}: {codigo or 'Nova Oferta'}",
-                        f"Loja: {loja}\nFonte: @{canal_limpo}\nCupom: {codigo or 'Ver na mensagem'}\n\n{texto_limpo}\n\nLink: {link_post}",
-                    )
+                # Guarda para enviar tudo em um único e-mail consolidado
+                bloco_email = (
+                    f"========================================\n"
+                    f"{loja} | Fonte: @{canal_limpo}\n"
+                    f"Cupom: {codigo or 'Aplicado no link'}\n"
+                    f"Detalhes:\n{texto_limpo}\n"
+                    f"Link: {link_post}\n"
+                )
+                novos_cupons_email.append(bloco_email)
+
         except Exception as erro:
             print(f"Erro ao ler @{canal_limpo}: {erro}")
 
-    if novos_encontrados > 0:
+    if novos_cupons_email:
         salvar_historico(historico)
+
+        qtd = len(novos_cupons_email)
+        assunto = f"🎟️ Resumo de Cupons: {qtd} {'novo cupom encontrado' if qtd == 1 else 'novos cupons encontrados'}"
+        corpo = (
+            f"O robô encontrou {qtd} {'novo cupom' if qtd == 1 else 'novos cupons'} nesta verificação:\n\n"
+            + "\n".join(novos_cupons_email)
+        )
+        enviar_email(assunto, corpo)
 
 if __name__ == "__main__":
     buscar_cupons()
