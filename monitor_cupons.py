@@ -16,6 +16,7 @@ ARQUIVO_HISTORICO = "historico_cupons.json"
 
 CANAIS_TELEGRAM = [
     "rochacupons",
+    "nerdcupons",
     "pelando",
     "promobit",
     "gatry",
@@ -24,20 +25,30 @@ CANAIS_TELEGRAM = [
     "cuponsmercadolivre",
     "ofertasamazonbr",
     "hardmob_promocoes",
-    "nerdcupons",
 ]
 
 LOJAS_ALVO = {
     "mercado livre": "🟡 Mercado Livre",
     "mercadolivre": "🟡 Mercado Livre",
+    "meli.la": "🟡 Mercado Livre",
     "meli": "🟡 Mercado Livre",
     "amazon": "📦 Amazon",
+    "amzn": "📦 Amazon",
     "shopee": "🟠 Shopee",
+    "shope": "🟠 Shopee",
 }
 
-TERMOS_CUPOM = [
-    "cupom", "cupons", "código", "codigo", "use o", "aplique",
-    "resgate", "% off", "reais off", "r$ ", "desconto"
+PALAVRAS_IGNORADAS = {
+    "HTTP", "HTTPS", "HTML", "FREE", "PARA", "COM", "SEM", "OFF",
+    "PIX", "APP", "PRIME", "FULL", "LINK", "AQUI", "HOJE", "AGORA",
+    "LOJA", "MAIS", "GRATIS", "FRETE", "LISTA", "CLIQUE", "VALIDO",
+    "ACIMA", "LIMITE", "CUPOM", "CUPONS", "NOVO", "CORRE", "AMAZON",
+    "SHOPEE", "MERCADO", "LIVRE", "OFERTA", "OFERTAS", "GRUPO", "GRUPOS"
+}
+
+LINHAS_LIXO = [
+    "mais grupos", "nerdofertas.com", "clique \"mostrar mais\"",
+    "entre no grupo", "canal de ofertas", "participe do", "siga nosso"
 ]
 
 HEADERS = {
@@ -56,7 +67,7 @@ def carregar_historico():
     return set()
 
 def salvar_historico(historico):
-    lista_limitada = list(historico)[-600:]
+    lista_limitada = list(historico)[-800:]
     with open(ARQUIVO_HISTORICO, "w", encoding="utf-8") as f:
         json.dump(lista_limitada, f, ensure_ascii=False, indent=2)
 
@@ -87,28 +98,89 @@ def identificar_loja(texto_lower):
             return nome_formatado
     return None
 
-def extrair_codigo(bloco_html, texto_limpo):
-    for tag_code in bloco_html.find_all(["code", "pre"]):
-        cand = tag_code.get_text(strip=True)
-        if 3 <= len(cand) <= 25 and " " not in cand:
-            return cand
-
-    candidatos = re.findall(r"\b([A-Z0-9]{4,20})\b", texto_limpo)
-    ignorados = {
-        "HTTP", "HTTPS", "HTML", "FREE", "PARA", "COM", "SEM", "OFF",
-        "PIX", "APP", "PRIME", "FULL", "LINK", "AQUI", "HOJE", "AGORA", "LOJA"
-    }
-    for c in candidatos:
-        if c not in ignorados and (any(ch.isdigit() for ch in c) or len(c) >= 6):
-            return c
-    return ""
-
 def escapar_html(texto):
     return (
         texto.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+def limpar_linhas(texto_bruto):
+    linhas_limpas = []
+    for linha in texto_bruto.splitlines():
+        l = linha.strip()
+        if not l:
+            continue
+        l_lower = l.lower()
+        # Remove URLs soltas e rodapés de divulgação de grupos
+        if l_lower.startswith("http") or any(lixo in l_lower for lixo in LINHAS_LIXO):
+            continue
+        # Remove emojis isolados na linha
+        sem_simbolos = re.sub(r"[^\w\s%$,.:;!?()-]", "", l).strip()
+        if len(sem_simbolos) < 2:
+            continue
+        linhas_limpas.append(sem_simbolos)
+    return linhas_limpas
+
+def extrair_cupons_estruturados(bloco_html, texto_bruto):
+    """
+    Retorna lista de tuplas (codigo, regra_resumida).
+    Descarta posts que não possuem código real de cupom.
+    """
+    linhas = limpar_linhas(texto_bruto)
+    codigos_encontrados = []
+
+    # 1. Prioridade: tags <code> ou <pre> (padrão do Telegram para cupons copiáveis)
+    for tag in bloco_html.find_all(["code", "pre"]):
+        cand = tag.get_text(strip=True).upper()
+        if re.fullmatch(r"[A-Z0-9]{4,20}", cand) and cand not in PALAVRAS_IGNORADAS:
+            if cand not in codigos_encontrados:
+                codigos_encontrados.append(cand)
+
+    # 2. Busca códigos em caixa alta no texto (ex: MOVEIS2011, BLACK100, CUPOM15)
+    for linha in linhas:
+        # Ignora linhas que parecem modelo de produto (ex: 748ml, B01zrah4i, 12000)
+        if re.search(r"\b\d+(ml|g|kg|gb|tb|btu|v|w|cm|mm)\b", linha.lower()):
+            continue
+        for match in re.findall(r"\b([A-Z0-9]{5,18})\b", linha):
+            if match in PALAVRAS_IGNORADAS or match.isdigit():
+                continue
+            # Precisa ter letras e números OU ter contexto explícito de cupom na linha
+            tem_letra_e_num = any(c.isalpha() for c in match) and any(c.isdigit() for c in match)
+            contexto_cupom = any(p in linha.lower() for p in ["cupom", "código", "codigo", "off", "limite", "acima de", "use"])
+            if (tem_letra_e_num or contexto_cupom) and match not in codigos_encontrados:
+                codigos_encontrados.append(match)
+
+    if not codigos_encontrados:
+        return []
+
+    resultados = []
+    for codigo in codigos_encontrados:
+        regra = ""
+        for idx, linha in enumerate(linhas):
+            if codigo in linha:
+                # Junta até 2 linhas imediatamente anteriores que tragam % OFF ou valor mínimo
+                contexto = []
+                for ant in linhas[max(0, idx - 2):idx]:
+                    if any(k in ant.lower() for k in ["off", "%", "r$", "acima", "limite", "desconto", "mínimo", "minimo"]):
+                        contexto.append(ant)
+                # Também aproveita texto da própria linha sem o código
+                resto_linha = linha.replace(codigo, "").strip(" :-•|")
+                if resto_linha and len(resto_linha) > 3:
+                    contexto.append(resto_linha)
+                regra = " | ".join(contexto)
+                break
+
+        if not regra:
+            # Pega a primeira linha que mencione desconto ou valor
+            for linha in linhas:
+                if any(k in linha.lower() for k in ["off", "%", "r$", "desconto"]):
+                    regra = linha
+                    break
+
+        resultados.append((codigo, regra[:140] if regra else "Cupom ativo (conferir regras no link)"))
+
+    return resultados
 
 def buscar_cupons():
     historico = carregar_historico()
@@ -133,61 +205,50 @@ def buscar_cupons():
                     continue
 
                 post_id = msg_div.get("data-post", "")
-                texto_limpo = texto_div.get_text("\n", strip=True)
-                texto_lower = texto_limpo.lower()
-
-                loja = identificar_loja(texto_lower)
+                texto_bruto = texto_div.get_text("\n", strip=True)
+                loja = identificar_loja(texto_bruto.lower())
                 if not loja:
                     continue
 
-                if not any(t in texto_lower for t in TERMOS_CUPOM):
+                pares_cupons = extrair_cupons_estruturados(texto_div, texto_bruto)
+                if not pares_cupons:
                     continue
-
-                codigo = extrair_codigo(texto_div, texto_limpo)
-                chave_unica = f"tg:{post_id}" if post_id else f"tg:{canal_limpo}:{texto_limpo[:60]}"
-
-                if chave_unica in historico:
-                    continue
-
-                historico.add(chave_unica)
 
                 link_post = f"https://t.me/{post_id}" if post_id else url_canal
-                resumo = escapar_html(texto_limpo[:450])
-                linha_codigo = f"🎟️ <b>Cupom:</b> <code>{escapar_html(codigo)}</code>\n" if codigo else ""
 
-                # Envia individualmente no Telegram (rápido e fácil de copiar com 1 toque)
-                msg_tg = (
-                    f"{loja} — <b>NOVO CUPOM</b>\n"
-                    f"📡 <i>Fonte: @{escapar_html(canal_limpo)}</i>\n\n"
-                    f"{linha_codigo}"
-                    f"📝 {resumo}\n\n"
-                    f"🔗 <a href=\"{link_post}\">Ver mensagem original</a>"
-                )
-                enviar_telegram(msg_tg)
+                for codigo, regra in pares_cupons:
+                    # Deduplica pelo par Loja + Código (evita receber o mesmo cupom de 5 canais diferentes)
+                    chave_unica = f"cupom:{loja}:{codigo}"
+                    if chave_unica in historico:
+                        continue
 
-                # Guarda para enviar tudo em um único e-mail consolidado
-                bloco_email = (
-                    f"========================================\n"
-                    f"{loja} | Fonte: @{canal_limpo}\n"
-                    f"Cupom: {codigo or 'Aplicado no link'}\n"
-                    f"Detalhes:\n{texto_limpo}\n"
-                    f"Link: {link_post}\n"
-                )
-                novos_cupons_email.append(bloco_email)
+                    historico.add(chave_unica)
+
+                    msg_tg = (
+                        f"{loja} — 🎟️ <code>{escapar_html(codigo)}</code>\n"
+                        f"📌 {escapar_html(regra)}\n"
+                        f"🔗 <a href=\"{link_post}\">Abrir oferta</a> (via @{escapar_html(canal_limpo)})"
+                    )
+                    enviar_telegram(msg_tg)
+
+                    bloco_email = (
+                        f"{loja} | Cupom: {codigo}\n"
+                        f"Regra: {regra}\n"
+                        f"Link: {link_post} (via @{canal_limpo})\n"
+                        f"----------------------------------------"
+                    )
+                    novos_cupons_email.append(bloco_email)
 
         except Exception as erro:
             print(f"Erro ao ler @{canal_limpo}: {erro}")
 
     if novos_cupons_email:
         salvar_historico(historico)
-
         qtd = len(novos_cupons_email)
-        assunto = f"🎟️ Resumo de Cupons: {qtd} {'novo cupom encontrado' if qtd == 1 else 'novos cupons encontrados'}"
-        corpo = (
-            f"O robô encontrou {qtd} {'novo cupom' if qtd == 1 else 'novos cupons'} nesta verificação:\n\n"
-            + "\n".join(novos_cupons_email)
+        enviar_email(
+            f"🎟️ {qtd} {'novo cupom' if qtd == 1 else 'novos cupons'} (ML / Amazon / Shopee)",
+            "Cupons inéditos capturados:\n\n" + "\n".join(novos_cupons_email),
         )
-        enviar_email(assunto, corpo)
 
 if __name__ == "__main__":
     buscar_cupons()
