@@ -3,8 +3,8 @@ import os
 import re
 import smtplib
 from email.mime.text import MIMEText
+import xml.etree.ElementTree as ET
 import requests
-from bs4 import BeautifulSoup
 
 TOKEN = os.environ["TELEGRAM_CUPONS_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -14,31 +14,23 @@ EMAIL_DESTINO = "marcusvaz.df@gmail.com"
 
 ARQUIVO_HISTORICO = "historico_cupons.json"
 
-FONTES = [
-    {
-        "loja": "Mercado Livre",
-        "emoji": "🟡",
-        "url": "https://www.cuponomia.com.br/desconto/mercado-livre",
-    },
-    {
-        "loja": "Amazon",
-        "emoji": "📦",
-        "url": "https://www.cuponomia.com.br/desconto/amazon",
-    },
-    {
-        "loja": "Shopee",
-        "emoji": "🟠",
-        "url": "https://www.cuponomia.com.br/desconto/shopee",
-    },
+FEEDS_RSS = [
+    "https://www.pelando.com.br/rss",
+    "https://www.promobit.com.br/rss/ofertas.xml",
 ]
 
+LOJAS_ALVO = {
+    "mercado livre": "🟡 Mercado Livre",
+    "mercadolivre": "🟡 Mercado Livre",
+    "amazon": "📦 Amazon",
+    "shopee": "🟠 Shopee",
+}
+
+TERMOS_CUPOM = ["cupom", "código", "codigo", "off", "desconto", "aplicar"]
+
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/129.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "pt-BR,pt;q=0.9",
+    "User-Agent": "Mozilla/5.0 (compatible; RSSReader/1.0)",
+    "Accept": "application/rss+xml, application/xml, text/xml",
 }
 
 def carregar_historico():
@@ -48,8 +40,7 @@ def carregar_historico():
     return set()
 
 def salvar_historico(historico):
-    # Mantém os últimos 300 registros para o arquivo não crescer indefinidamente
-    lista_limitada = list(historico)[-300:]
+    lista_limitada = list(historico)[-400:]
     with open(ARQUIVO_HISTORICO, "w", encoding="utf-8") as f:
         json.dump(lista_limitada, f, ensure_ascii=False, indent=2)
 
@@ -74,59 +65,88 @@ def enviar_email(assunto, corpo):
         servidor.login(EMAIL_USER, EMAIL_PASS)
         servidor.send_message(msg)
 
+def identificar_loja(texto_lower):
+    for chave, nome_formatado in LOJAS_ALVO.items():
+        if chave in texto_lower:
+            return nome_formatado
+    return None
+
+def extrair_codigo(texto):
+    # Procura códigos em caixa alta típicos de cupom (ex: BLACK100, MELI20, SHOPEE15)
+    candidatos = re.findall(r"\b([A-Z0-9]{4,18})\b", texto)
+    ignorados = {"HTTP", "HTTPS", "HTML", "FREE", "PARA", "COM", "SEM", "OFF", "PIX", "APP", "PRIME", "FULL"}
+    for c in candidatos:
+        if c not in ignorados and (any(ch.isdigit() for ch in c) or len(c) >= 6):
+            return c
+    return ""
+
 def buscar_cupons():
+    primeira_execucao = not os.path.exists(ARQUIVO_HISTORICO)
     historico = carregar_historico()
     novos_encontrados = 0
 
-    for fonte in FONTES:
+    for feed_url in FEEDS_RSS:
         try:
-            resp = requests.get(fonte["url"], headers=HEADERS, timeout=20)
+            resp = requests.get(feed_url, headers=HEADERS, timeout=20)
             if resp.status_code != 200:
+                print(f"Status {resp.status_code} em {feed_url}")
                 continue
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            blocos = soup.select("[data-coupon-code], .coupon-item, article")
+            root = ET.fromstring(resp.content)
+            itens = root.findall(".//item")
 
-            for bloco in blocos:
-                texto = " ".join(bloco.get_text(" ", strip=True).split())
-                if len(texto) < 15 or len(texto) > 260:
+            for item in itens:
+                titulo = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                descricao_raw = item.findtext("description") or ""
+                descricao = re.sub(r"<[^>]+>", " ", descricao_raw)
+                descricao = " ".join(descricao.split())
+
+                texto_completo = f"{titulo} {descricao}"
+                texto_lower = texto_completo.lower()
+
+                loja = identificar_loja(texto_lower)
+                if not loja:
                     continue
 
-                if not any(p in texto.lower() for p in ["off", "%", "r$", "frete", "cupom", "desconto"]):
+                if not any(t in texto_lower for t in TERMOS_CUPOM):
                     continue
 
-                codigo = bloco.get("data-coupon-code", "").strip()
-                if not codigo:
-                    match = re.search(r"\b([A-Z0-9]{4,18})\b", texto)
-                    if match and any(c.isdigit() for c in match.group(1)):
-                        codigo = match.group(1)
-
-                chave_unica = f"{fonte['loja']}:{codigo or texto[:60]}"
+                chave_unica = link or titulo
                 if chave_unica in historico:
                     continue
 
                 historico.add(chave_unica)
                 novos_encontrados += 1
 
-                linha_codigo = f"🎟️ *Código:* `{codigo}`\n" if codigo else ""
+                codigo = extrair_codigo(texto_completo)
+                linha_codigo = f"🎟️ *Possível Código:* `{codigo}`\n" if codigo else ""
+
                 msg_tg = (
-                    f"{fonte['emoji']} *NOVO CUPOM — {fonte['loja'].upper()}*\n\n"
+                    f"{loja} — *CUPOM / OFERTA*\n\n"
                     f"{linha_codigo}"
-                    f"📝 *Detalhe:* {texto[:180]}\n"
-                    f"🔗 [Ver cupons da loja]({fonte['url']})"
+                    f"📝 *Título:* {titulo}\n"
+                    f"🔗 [Abrir oferta]({link})"
                 )
                 enviar_telegram(msg_tg)
 
                 if EMAIL_USER and EMAIL_PASS:
                     enviar_email(
-                        f"🎟️ Cupom {fonte['loja']}: {codigo or 'Nova Oferta'}",
-                        f"Loja: {fonte['loja']}\nCódigo: {codigo or 'Aplicado no link'}\nDetalhe: {texto}\nLink: {fonte['url']}",
+                        f"🎟️ {loja}: {codigo or titulo[:50]}",
+                        f"Loja: {loja}\nCódigo: {codigo or 'Ver no link'}\nTítulo: {titulo}\nDetalhes: {descricao[:300]}\nLink: {link}",
                     )
         except Exception as erro:
-            print(f"Erro ao consultar {fonte['loja']}: {erro}")
+            print(f"Erro ao ler {feed_url}: {erro}")
 
-    if novos_encontrados > 0:
+    if novos_encontrados > 0 or primeira_execucao:
         salvar_historico(historico)
+
+    if primeira_execucao:
+        enviar_telegram(
+            f"✅ *Monitor de Cupons ativado!*\n"
+            f"Cupons encontrados nesta primeira varredura: *{novos_encontrados}*.\n"
+            f"A partir de agora você receberá apenas cupons inéditos a cada 15 minutos."
+        )
 
 if __name__ == "__main__":
     buscar_cupons()
