@@ -1,16 +1,11 @@
 import json
 import os
 import re
-import smtplib
-from email.mime.text import MIMEText
 import requests
 from bs4 import BeautifulSoup
 
 TOKEN = os.environ["TELEGRAM_CUPONS_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-EMAIL_USER = os.environ.get("EMAIL_USER", "")
-EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
-EMAIL_DESTINO = "marcusvaz.df@gmail.com"
 
 ARQUIVO_HISTORICO = "historico_cupons.json"
 
@@ -48,7 +43,6 @@ PALAVRAS_IGNORADAS = {
     "HDMI", "USB", "BIVOLT", "110V", "220V", "PRETO", "BRANCO"
 }
 
-# Bloqueia especificações técnicas de eletrônicos (ex: 8GB256GB, 2HDMI, 300HZ, 128GB)
 PADRAO_HARDWARE = re.compile(
     r"^(\d+(GB|TB|MB|HZ|W|V|ML|KG|HDMI|USB|MP|MAH)|.*(GBRAM|HDMI|HDR|OLED|QLED|DLED|BIVOLT).*)$"
 )
@@ -87,17 +81,6 @@ def enviar_telegram(mensagem):
         "disable_web_page_preview": True,
     }
     requests.post(url, json=payload, timeout=10)
-
-def enviar_email(assunto, corpo):
-    if not EMAIL_USER or not EMAIL_PASS:
-        return
-    msg = MIMEText(corpo, "plain", "utf-8")
-    msg["Subject"] = assunto
-    msg["From"] = EMAIL_USER
-    msg["To"] = EMAIL_DESTINO
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as servidor:
-        servidor.login(EMAIL_USER, EMAIL_PASS)
-        servidor.send_message(msg)
 
 def identificar_loja(texto_lower):
     for chave, nome_formatado in LOJAS_ALVO.items():
@@ -139,13 +122,11 @@ def extrair_cupons_estruturados(bloco_html, texto_bruto):
     linhas = limpar_linhas(texto_bruto)
     codigos_encontrados = []
 
-    # 1. Prioridade absoluta: tags <code> ou <pre> (padrão do Telegram para copiar cupom)
     for tag in bloco_html.find_all(["code", "pre"]):
         cand = tag.get_text(strip=True).upper()
         if codigo_valido(cand) and cand not in codigos_encontrados:
             codigos_encontrados.append(cand)
 
-    # 2. Busca apenas códigos precedidos por gatilho explícito de cupom na mesma linha ou na linha anterior
     gatilhos = re.compile(
         r"(?:cupom|c[oó]digo|use|aplique|resgate|limite\s+r\$\s*\d+\s*off)\s*[:\-]?\s*([A-Z0-9]{4,20})\b",
         re.IGNORECASE,
@@ -156,7 +137,6 @@ def extrair_cupons_estruturados(bloco_html, texto_bruto):
             if codigo_valido(cand) and cand not in codigos_encontrados:
                 codigos_encontrados.append(cand)
 
-        # Caso a linha anterior diga "Use o cupom:" e o código esteja isolado na linha seguinte
         if idx > 0 and re.search(r"(cupom|c[oó]digo|aplique|resgate)\s*[:\-]?\s*$", linhas[idx - 1], re.IGNORECASE):
             cand = linha.strip().upper()
             if codigo_valido(cand) and cand not in codigos_encontrados:
@@ -192,7 +172,7 @@ def extrair_cupons_estruturados(bloco_html, texto_bruto):
 
 def buscar_cupons():
     historico = carregar_historico()
-    novos_cupons_email = []
+    houve_novos = False
 
     for canal in CANAIS_TELEGRAM:
         canal_limpo = canal.lstrip("@").strip()
@@ -230,6 +210,7 @@ def buscar_cupons():
                         continue
 
                     historico.add(chave_unica)
+                    houve_novos = True
 
                     msg_tg = (
                         f"{loja} — 🎟️ <code>{escapar_html(codigo)}</code>\n"
@@ -238,24 +219,11 @@ def buscar_cupons():
                     )
                     enviar_telegram(msg_tg)
 
-                    bloco_email = (
-                        f"{loja} | Cupom: {codigo}\n"
-                        f"Regra: {regra}\n"
-                        f"Link: {link_post} (via @{canal_limpo})\n"
-                        f"----------------------------------------"
-                    )
-                    novos_cupons_email.append(bloco_email)
-
         except Exception as erro:
             print(f"Erro ao ler @{canal_limpo}: {erro}")
 
-    if novos_cupons_email:
+    if houve_novos:
         salvar_historico(historico)
-        qtd = len(novos_cupons_email)
-        enviar_email(
-            f"🎟️ {qtd} {'novo cupom' if qtd == 1 else 'novos cupons'} (ML / Amazon / Shopee)",
-            "Cupons inéditos capturados:\n\n" + "\n".join(novos_cupons_email),
-        )
 
 if __name__ == "__main__":
     buscar_cupons()
