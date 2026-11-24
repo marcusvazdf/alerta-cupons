@@ -20,6 +20,8 @@ CANAIS_TELEGRAM = [
     "cuponsmercadolivre",
     "ofertasamazonbr",
     "hardmob_promocoes",
+    "urubudospromos",
+    "pechinchou",
 ]
 
 LOJAS_ALVO = {
@@ -31,6 +33,8 @@ LOJAS_ALVO = {
     "amzn": "📦 Amazon",
     "shopee": "🟠 Shopee",
     "shope": "🟠 Shopee",
+    "magalu": "🔵 Magalu",
+    "kabum": "🟠 KaBuM!",
 }
 
 PALAVRAS_IGNORADAS = {
@@ -68,7 +72,7 @@ def carregar_historico():
     return set()
 
 def salvar_historico(historico):
-    lista_limitada = list(historico)[-800:]
+    lista_limitada = list(historico)[-1200:]
     with open(ARQUIVO_HISTORICO, "w", encoding="utf-8") as f:
         json.dump(lista_limitada, f, ensure_ascii=False, indent=2)
 
@@ -94,6 +98,28 @@ def escapar_html(texto):
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+def eh_oferta_alvo(texto_lower):
+    # Detecta menções diretas a console PS5 (excluindo jogos/capas/controles avulsos)
+    tem_ps5 = any(k in texto_lower for k in ["ps5", "playstation 5"])
+    eh_console_ps5 = (
+        tem_ps5
+        and any(k in texto_lower for k in ["console", "slim", "bundle", "825gb", "1tb", "leitor", "digital"])
+        and not any(x in texto_lower for x in ["jogo ", "midia fisica", "mídia física", "capa ", "suporte ", "grip", "pelicula", "película"])
+    )
+
+    # Detecta menções a Ar Condicionado LG Dual Inverter 9000
+    eh_ar_lg = (
+        "lg" in texto_lower
+        and "9000" in texto_lower
+        and any(k in texto_lower for k in ["inverter", "ar condicionado", "ar-condicionado", "compact"])
+    )
+
+    if eh_console_ps5:
+        return "🎮 OFERTA PS5 DETECTADA"
+    if eh_ar_lg:
+        return "❄️ OFERTA AR LG 9000 DETECTADA"
+    return None
 
 def codigo_valido(cand):
     if not re.fullmatch(r"[A-Z0-9]{4,20}", cand):
@@ -186,7 +212,7 @@ def buscar_cupons():
             soup = BeautifulSoup(resp.text, "html.parser")
             mensagens = soup.select(".tgme_widget_message_wrap")
 
-            for msg_wrap in mensagens[-12:]:
+            for msg_wrap in mensagens[-15:]:
                 msg_div = msg_wrap.select_one(".tgme_widget_message")
                 texto_div = msg_wrap.select_one(".tgme_widget_message_text")
                 if not msg_div or not texto_div:
@@ -194,15 +220,33 @@ def buscar_cupons():
 
                 post_id = msg_div.get("data-post", "")
                 texto_bruto = texto_div.get_text("\n", strip=True)
-                loja = identificar_loja(texto_bruto.lower())
+                texto_lower = texto_bruto.lower()
+                link_post = f"https://t.me/{post_id}" if post_id else url_canal
+
+                # 1) Alerta prioritário de oferta direta do PS5 ou Ar LG (mesmo sem cupom)
+                alerta_produto = eh_oferta_alvo(texto_lower)
+                if alerta_produto and post_id:
+                    chave_oferta = f"oferta_alvo:{post_id}"
+                    if chave_oferta not in historico:
+                        historico.add(chave_oferta)
+                        houve_novos = True
+                        linhas_resumo = limpar_linhas(texto_bruto)[:5]
+                        resumo_formatado = "\n".join(linhas_resumo)
+                        msg_oferta = (
+                            f"🚨 <b>{alerta_produto}</b>\n"
+                            f"{escapar_html(resumo_formatado)}\n"
+                            f"🔗 <a href=\"{link_post}\">Abrir postagem original</a> (via @{escapar_html(canal_limpo)})"
+                        )
+                        enviar_telegram(msg_oferta)
+
+                # 2) Extração normal de cupons
+                loja = identificar_loja(texto_lower)
                 if not loja:
                     continue
 
                 pares_cupons = extrair_cupons_estruturados(texto_div, texto_bruto)
                 if not pares_cupons:
                     continue
-
-                link_post = f"https://t.me/{post_id}" if post_id else url_canal
 
                 for codigo, regra in pares_cupons:
                     chave_unica = f"cupom:{loja}:{codigo}"
