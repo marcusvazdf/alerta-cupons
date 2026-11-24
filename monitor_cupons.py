@@ -57,7 +57,9 @@ PALAVRAS_IGNORADAS = {
     "ACIMA", "LIMITE", "CUPOM", "CUPONS", "NOVO", "CORRE", "AMAZON",
     "SHOPEE", "MERCADO", "LIVRE", "OFERTA", "OFERTAS", "GRUPO", "GRUPOS",
     "HDR10", "FHD", "UHD", "QLED", "OLED", "DLED", "SMART", "WIFI",
-    "HDMI", "USB", "BIVOLT", "110V", "220V", "PRETO", "BRANCO"
+    "HDMI", "USB", "BIVOLT", "110V", "220V", "PRETO", "BRANCO",
+    "APLIQUE", "RESGATE", "COPIE", "USE", "CODIGO", "DESCONTO",
+    "DISPONIVEL", "ESGOTADO", "ATENCAO", "PESSOAL", "BOT", "PRECO", "PRECOS"
 }
 
 PADRAO_HARDWARE = re.compile(
@@ -66,7 +68,8 @@ PADRAO_HARDWARE = re.compile(
 
 LINHAS_LIXO = [
     "mais grupos", "nerdofertas.com", "clique \"mostrar mais\"",
-    "entre no grupo", "canal de ofertas", "participe do", "siga nosso"
+    "entre no grupo", "canal de ofertas", "participe do", "siga nosso",
+    "monitorar preço deste produto", "vocês sabiam que temos um"
 ]
 
 HEADERS = {
@@ -94,7 +97,6 @@ def salvar_historico(historico):
 
 def enviar_telegram(mensagem):
     if not TOKEN or not CHAT_ID:
-        print("ERRO: TELEGRAM_CUPONS_TOKEN ou TELEGRAM_CHAT_ID ausente.")
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {
@@ -118,32 +120,74 @@ def escapar_html(texto):
         .replace(">", "&gt;")
     )
 
-def eh_oferta_alvo(texto_lower):
+def extrair_menor_preco(texto):
+    # Captura valores no padrão R$ 3.875,00 ou R$ 3875,90 (ignora parcelas como "15x de R$313")
+    texto_sem_parcelas = re.sub(r"\d+\s*x\s*(?:de\s*)?r\$\s*[\d.,]+", "", texto, flags=re.IGNORECASE)
+    matches = re.findall(r"r\$\s*(\d{1,2}\.?\d{3}(?:,\d{2})?)", texto_sem_parcelas, flags=re.IGNORECASE)
+    valores = []
+    for m in matches:
+        num_str = m.replace(".", "").replace(",", ".")
+        try:
+            val = float(num_str)
+            if val >= 1000:
+                valores.append(val)
+        except ValueError:
+            pass
+    return min(valores) if valores else None
+
+def avaliar_oferta_alvo(texto_bruto, texto_lower):
+    # Ignora avisos institucionais do canal
+    if any(aviso in texto_lower for aviso in ["vocês sabiam que temos um", "bot que monitora", "atenção, pessoal"]):
+        return None, None
+
+    menor_preco = extrair_menor_preco(texto_bruto)
+    if not menor_preco:
+        return None, None
+
+    # 1) Avaliação PS5
     tem_ps5 = any(k in texto_lower for k in ["ps5", "playstation 5"])
     eh_console_ps5 = (
         tem_ps5
         and any(k in texto_lower for k in ["console", "slim", "bundle", "825gb", "1tb", "leitor", "digital"])
-        and not any(x in texto_lower for x in ["jogo ", "midia fisica", "mídia física", "capa ", "suporte ", "grip", "pelicula", "película"])
+        and not any(x in texto_lower for x in ["jogo ", "midia fisica", "mídia física", "capa ", "suporte ", "grip", "pelicula", "película", "controle dualsense"])
     )
 
+    if eh_console_ps5:
+        eh_digital = "digital" in texto_lower and "com leitor" not in texto_lower
+        if eh_digital:
+            # Só avisa PS5 Digital se estiver até R$ 3.600,00 (para fechar <= R$ 4.050 com leitor avulso)
+            if 2500 <= menor_preco <= 3600.00:
+                chave_dedup = f"ps5_digital:{int(menor_preco)}"
+                return f"🎮 PS5 SLIM DIGITAL POR R$ {menor_preco:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), chave_dedup
+        else:
+            # PS5 Slim com Leitor: avisa até R$ 4.050,00
+            if 2800 <= menor_preco <= 4050.00:
+                chave_dedup = f"ps5_leitor:{int(menor_preco)}"
+                return f"🎮 PS5 SLIM COM LEITOR POR R$ {menor_preco:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), chave_dedup
+        return None, None
+
+    # 2) Avaliação Ar Condicionado LG Dual Inverter 9000 BTUs
     eh_ar_lg = (
         "lg" in texto_lower
         and "9000" in texto_lower
         and any(k in texto_lower for k in ["inverter", "ar condicionado", "ar-condicionado", "compact"])
     )
 
-    if eh_console_ps5:
-        return "🎮 OFERTA PS5 DETECTADA"
-    if eh_ar_lg:
-        return "❄️ OFERTA AR LG 9000 DETECTADA"
-    return None
+    if eh_ar_lg and 1300 <= menor_preco <= 1950.00:
+        chave_dedup = f"ar_lg_9000:{int(menor_preco)}"
+        return f"❄️ AR LG 9000 BTUs POR R$ {menor_preco:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), chave_dedup
 
-def codigo_valido(cand):
+    return None, None
+
+def codigo_valido(cand, veio_de_tag_code=False):
     if not re.fullmatch(r"[A-Z0-9]{4,20}", cand):
         return False
     if cand in PALAVRAS_IGNORADAS or cand.isdigit():
         return False
     if PADRAO_HARDWARE.match(cand):
+        return False
+    # Se não veio de bloco copiável (<code>/<pre>), exige ao menos 1 número para evitar palavras soltas (ex: APLIQUE, CORRE)
+    if not veio_de_tag_code and not re.search(r"\d", cand):
         return False
     return True
 
@@ -167,7 +211,7 @@ def extrair_cupons_estruturados(bloco_html, texto_bruto):
 
     for tag in bloco_html.find_all(["code", "pre"]):
         cand = tag.get_text(strip=True).upper()
-        if codigo_valido(cand) and cand not in codigos_encontrados:
+        if codigo_valido(cand, veio_de_tag_code=True) and cand not in codigos_encontrados:
             codigos_encontrados.append(cand)
 
     gatilhos = re.compile(
@@ -177,12 +221,12 @@ def extrair_cupons_estruturados(bloco_html, texto_bruto):
     for idx, linha in enumerate(linhas):
         for match in gatilhos.findall(linha):
             cand = match.upper()
-            if codigo_valido(cand) and cand not in codigos_encontrados:
+            if codigo_valido(cand, veio_de_tag_code=False) and cand not in codigos_encontrados:
                 codigos_encontrados.append(cand)
 
         if idx > 0 and re.search(r"(cupom|c[oó]digo|aplique|resgate)\s*[:\-]?\s*$", linhas[idx - 1], re.IGNORECASE):
             cand = linha.strip().upper()
-            if codigo_valido(cand) and cand not in codigos_encontrados:
+            if codigo_valido(cand, veio_de_tag_code=False) and cand not in codigos_encontrados:
                 codigos_encontrados.append(cand)
 
     if not codigos_encontrados:
@@ -229,16 +273,15 @@ def varrer_pelando_direto(historico):
                 if not href or len(titulo) < 10:
                     continue
                 link_completo = f"https://www.pelando.com.br{href}" if href.startswith("/") else href
-                alerta = eh_oferta_alvo(titulo.lower())
-                if not alerta:
+                titulo_alerta, chave_dedup = avaliar_oferta_alvo(titulo, titulo.lower())
+                if not titulo_alerta or not chave_dedup:
                     continue
-                chave = f"pelando:{link_completo}"
-                if chave in historico:
+                if chave_dedup in historico:
                     continue
-                historico.add(chave)
+                historico.add(chave_dedup)
                 alterou = True
                 msg = (
-                    f"🚨 <b>{alerta} (Pelando)</b>\n"
+                    f"🚨 <b>{escapar_html(titulo_alerta)} (Pelando)</b>\n"
                     f"📌 {escapar_html(titulo[:160])}\n"
                     f"🔗 <a href=\"{link_completo}\">Ver oferta no Pelando</a>"
                 )
@@ -279,21 +322,22 @@ def buscar_cupons():
                 texto_lower = texto_bruto.lower()
                 link_post = f"https://t.me/{post_id}" if post_id else url_canal
 
-                alerta_produto = eh_oferta_alvo(texto_lower)
-                if alerta_produto and post_id:
-                    chave_oferta = f"oferta_alvo:{post_id}"
-                    if chave_oferta not in historico:
-                        historico.add(chave_oferta)
+                # 1) Alerta prioritário de oferta dentro da faixa de preço alvo
+                titulo_alerta, chave_dedup = avaliar_oferta_alvo(texto_bruto, texto_lower)
+                if titulo_alerta and chave_dedup:
+                    if chave_dedup not in historico:
+                        historico.add(chave_dedup)
                         houve_novos = True
                         linhas_resumo = limpar_linhas(texto_bruto)[:5]
                         resumo_formatado = "\n".join(linhas_resumo)
                         msg_oferta = (
-                            f"🚨 <b>{alerta_produto}</b>\n"
+                            f"🚨 <b>{escapar_html(titulo_alerta)}</b>\n"
                             f"{escapar_html(resumo_formatado)}\n"
                             f"🔗 <a href=\"{link_post}\">Abrir postagem original</a> (via @{escapar_html(canal_limpo)})"
                         )
                         enviar_telegram(msg_oferta)
 
+                # 2) Extração normal de cupons reais
                 loja = identificar_loja(texto_lower)
                 if not loja:
                     continue
